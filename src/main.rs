@@ -6,9 +6,10 @@ use clap::Parser;
 use futures::stream::{FuturesUnordered, StreamExt};
 use http_body_util::Empty;
 use hyper::body::Bytes;
-use hyper::{Request, Uri};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use tokio::net::TcpStream;
+use hyper::Uri;
+use hyper_rustls::ConfigBuilderExt;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 use tokio::time::sleep;
 
 #[derive(Parser)]
@@ -50,24 +51,18 @@ async fn main() -> Result<(), anyhow::Error> {
     let in_flight = Arc::new(AtomicUsize::new(0));
     let in_flight_samples = Arc::new(Mutex::new(Vec::new()));
 
-    // Get the host and the port
-    let host = uri.host().expect("uri has no host");
-    let port = uri.port_u16().unwrap_or(80);
-    let address = format!("{}:{}", host, port);
-
-    // Open a TCP connection to the remote host
-    let stream = TcpStream::connect(address).await?;
-    let io = TokioIo::new(stream);
-
     // Create the Hyper client
-    let (sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io).await?;
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(
+            rustls::ClientConfig::builder()
+                .with_native_roots()?
+                .with_no_client_auth(),
+        )
+        .https_or_http()
+        .enable_http1()
+        .build();
 
-    // Spawn a task to poll the connection, driving the HTTP state
-    tokio::task::spawn(async move {
-        if let Err(err) = conn.await {
-            println!("Connection failed: {:?}", err);
-        }
-    });
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
 
     let in_flight_clone = in_flight.clone();
     let in_flight_samples_clone = in_flight_samples.clone();
@@ -85,19 +80,14 @@ async fn main() -> Result<(), anyhow::Error> {
         let mut futures = FuturesUnordered::new();
 
         for _ in 0..total_requests {
-            let mut sender = sender.clone();
+            let client = client.clone();
             let uri = uri.clone();
             let success_count = success_count.clone();
             let response_times = response_times.clone();
             let in_flight = in_flight.clone();
 
-            // The authority of our URL will be the hostname of the remote
-            let authority = uri.authority().unwrap().clone();
-
             futures.push(tokio::spawn(async move {
-                if let Ok(duration) =
-                    make_request(&mut sender, uri, authority.as_str(), in_flight).await
-                {
+                if let Ok(duration) = make_request(client, uri, in_flight).await {
                     {
                         let mut sc = success_count.lock().unwrap();
                         *sc += 1;
@@ -145,22 +135,18 @@ async fn main() -> Result<(), anyhow::Error> {
 }
 
 async fn make_request(
-    sender: &mut hyper::client::conn::http2::SendRequest<Empty<Bytes>>,
-    uri: Uri,
-    authority: &str,
+    client: Client<
+        hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        Empty<Bytes>,
+    >,
+    uri: hyper::Uri,
     in_flight: Arc<AtomicUsize>,
 ) -> Result<Duration, anyhow::Error> {
     let start = Instant::now();
 
-    // Create an HTTP request with an empty body and a HOST header
-    let req = Request::builder()
-        .uri(uri)
-        .header(hyper::header::HOST, authority)
-        .body(Empty::<Bytes>::new())?;
-
     // Await the response...
     in_flight.fetch_add(1, Ordering::SeqCst);
-    sender.send_request(req).await?;
+    client.get(uri).await?;
     in_flight.fetch_sub(1, Ordering::SeqCst);
 
     Ok(start.elapsed())
