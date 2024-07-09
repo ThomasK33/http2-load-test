@@ -78,6 +78,10 @@ enhancement. One could use libraries such as `hyper-tls` or `hyper-rustls` to im
 TLS on top of the existing setup. These libraries provide convenient wrappers around
 the Hyper client to enable secure connections.
 
+> [!NOTE]
+> As adding hyper-rustls technically doesn't fulfil the requirement of not wrapping
+> hyper, the code implementing a TLS version is located on a separate branch [`hypertls`](https://github.com/ThomasK33/http2-load-test/tree/hypertls).
+
 ## Future Improvements
 
 - Add more detailed error handling.
