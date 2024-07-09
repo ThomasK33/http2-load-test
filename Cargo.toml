@@ -8,6 +8,12 @@ anyhow = "1.0.86"
 clap = { version = "4.5.9", features = ["derive"] }
 futures = "0.3.30"
 http-body-util = "0.1.2"
-hyper = { version = "1.4.1", features = ["full"] }
-hyper-util = { version = "0.1.6", features = ["full"] }
-tokio = { version = "1.38.0", features = ["full"] }
+hyper = { version = "1.4.1", features = ["client", "http2"] }
+hyper-util = { version = "0.1.6", features = ["tokio"] }
+tokio = { version = "1.38.0", features = [
+  "net",
+  "time",
+  "rt",
+  "macros",
+  "rt-multi-thread",
+] }

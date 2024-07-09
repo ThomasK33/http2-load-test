@@ -1,7 +1,7 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::anyhow;
 use clap::Parser;
 use futures::stream::{FuturesUnordered, StreamExt};
 use http_body_util::Empty;
@@ -30,12 +30,16 @@ struct Cli {
 async fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
 
-    let uri = cli.address.parse::<hyper::Uri>()?;
+    let mut uri = cli.address.parse::<hyper::Uri>()?;
     if uri.scheme().is_none() {
-        return Err(anyhow!(
-            "Missing URI schemes. Currently supported schemes are \"http://\"."
-        ));
+        uri = Uri::builder()
+            .scheme("http")
+            .authority(uri.authority().unwrap().as_str())
+            .path_and_query(uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(""))
+            .build()
+            .unwrap();
     }
+    let uri = uri;
 
     let delay = Duration::from_secs_f64(1.0 / cli.rate);
     let total_requests = cli.total;
@@ -43,6 +47,8 @@ async fn main() -> Result<(), anyhow::Error> {
     // Shared counters and vars
     let success_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let response_times = Arc::new(Mutex::new(Vec::new()));
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let in_flight_samples = Arc::new(Mutex::new(Vec::new()));
 
     // Get the host and the port
     let host = uri.host().expect("uri has no host");
@@ -63,6 +69,17 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     });
 
+    let in_flight_clone = in_flight.clone();
+    let in_flight_samples_clone = in_flight_samples.clone();
+
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_millis(100)).await;
+            let sample = in_flight_clone.load(std::sync::atomic::Ordering::SeqCst);
+            in_flight_samples_clone.lock().unwrap().push(sample);
+        }
+    });
+
     // Perform the requests
     {
         let mut futures = FuturesUnordered::new();
@@ -72,12 +89,15 @@ async fn main() -> Result<(), anyhow::Error> {
             let uri = uri.clone();
             let success_count = success_count.clone();
             let response_times = response_times.clone();
+            let in_flight = in_flight.clone();
 
             // The authority of our URL will be the hostname of the remote
             let authority = uri.authority().unwrap().clone();
 
             futures.push(tokio::spawn(async move {
-                if let Ok(duration) = make_request(&mut sender, uri, authority.as_str()).await {
+                if let Ok(duration) =
+                    make_request(&mut sender, uri, authority.as_str(), in_flight).await
+                {
                     {
                         let mut sc = success_count.lock().unwrap();
                         *sc += 1;
@@ -96,6 +116,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // Gather and compute stats
     let success_count = *success_count.lock().unwrap();
     let response_times = response_times.lock().unwrap();
+    let in_flight_samples = in_flight_samples.lock().unwrap();
 
     let success_rate = (success_count as f64 / total_requests as f64) * 100.0;
     let median_response_time = {
@@ -107,9 +128,18 @@ async fn main() -> Result<(), anyhow::Error> {
             times[times.len() / 2]
         }
     };
+    let average_in_flight = {
+        let total_samples: usize = in_flight_samples.iter().sum();
+        if in_flight_samples.len() > 0 {
+            total_samples as f64 / in_flight_samples.len() as f64
+        } else {
+            0.0
+        }
+    };
 
     println!("success: {:.1}%", success_rate);
     println!("median response time: {:.2?}", median_response_time);
+    println!("average in-flight: {:.2}", average_in_flight);
 
     Ok(())
 }
@@ -118,6 +148,7 @@ async fn make_request(
     sender: &mut hyper::client::conn::http2::SendRequest<Empty<Bytes>>,
     uri: Uri,
     authority: &str,
+    in_flight: Arc<AtomicUsize>,
 ) -> Result<Duration, anyhow::Error> {
     let start = Instant::now();
 
@@ -128,7 +159,9 @@ async fn make_request(
         .body(Empty::<Bytes>::new())?;
 
     // Await the response...
+    in_flight.fetch_add(1, Ordering::SeqCst);
     sender.send_request(req).await?;
+    in_flight.fetch_sub(1, Ordering::SeqCst);
 
     Ok(start.elapsed())
 }
