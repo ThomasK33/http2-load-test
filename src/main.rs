@@ -59,7 +59,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 .with_no_client_auth(),
         )
         .https_or_http()
-        .enable_http1()
+        .enable_http2()
         .build();
 
     let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
